@@ -24,8 +24,28 @@ from matplotlib.widgets import Slider
 SNAPSHOT_RE = re.compile(r"rank_(\d{3})_step_(\d{6})\.bin$")
 
 
-def summarize_scaling(csv_path: str) -> None:
-    """Read CSV rows and print one normalized line per scaling run."""
+def parse_int(value: str) -> int:
+    """Parse integer-like strings safely; return -1 when unavailable."""
+    if value is None:
+        return -1
+    text = str(value).strip()
+    if not text:
+        return -1
+    try:
+        return int(text)
+    except ValueError:
+        return -1
+
+
+def series_label(variant: str, threads: int) -> str:
+    """Build plotting label; include thread count for OMP-based variants."""
+    if variant in ("omp", "hybrid") and threads > 0:
+        return f"{variant}-t{threads}"
+    return variant
+
+
+def load_scaling_runs(csv_path: str) -> list:
+    """Read CSV rows and return normalized scaling run dictionaries."""
     parsed_runs = []
 
     with open(csv_path, "r", newline="", encoding="utf-8") as f:
@@ -33,8 +53,7 @@ def summarize_scaling(csv_path: str) -> None:
         rows = list(reader)
 
     if not rows:
-        print(f"No usable rows found in {csv_path}")
-        return
+        return []
 
     header = [h.strip() for h in rows[0]]
     data_rows = rows[1:]
@@ -49,6 +68,7 @@ def summarize_scaling(csv_path: str) -> None:
         ny = ""
         nranks = ""
         nsteps = ""
+        threads = ""
         t = None
 
         # Preferred parse path: named columns.
@@ -64,6 +84,10 @@ def summarize_scaling(csv_path: str) -> None:
             nranks = row[header_idx["nranks"]].strip()
         if "nsteps" in header_idx and header_idx["nsteps"] < len(row):
             nsteps = row[header_idx["nsteps"]].strip()
+        if "omp_threads" in header_idx and header_idx["omp_threads"] < len(row):
+            threads = row[header_idx["omp_threads"]].strip()
+        elif "threads" in header_idx and header_idx["threads"] < len(row):
+            threads = row[header_idx["threads"]].strip()
 
         if "time_s" in header_idx and header_idx["time_s"] < len(row):
             val = row[header_idx["time_s"]].strip()
@@ -99,18 +123,149 @@ def summarize_scaling(csv_path: str) -> None:
                 t = None
 
         if variant and t is not None:
-            parsed_runs.append((variant, nx, ny, nranks, nsteps, t))
+            parsed_runs.append(
+                {
+                    "variant": variant,
+                    "nx": parse_int(nx),
+                    "ny": parse_int(ny),
+                    "nranks": parse_int(nranks),
+                    "nsteps": parse_int(nsteps),
+                    "threads": parse_int(threads),
+                    "wall_time_s": t,
+                }
+            )
 
+    return parsed_runs
+
+
+def summarize_scaling_runs(parsed_runs: list, csv_path: str) -> None:
+    """Print one normalized line per scaling run."""
     if not parsed_runs:
         print(f"No usable rows found in {csv_path}")
         return
 
-    print("variant,trial,nx,ny,nranks,nsteps,wall_time_s")
-    trial_by_variant = defaultdict(int)
-    for variant, nx, ny, nranks, nsteps, wall_time in parsed_runs:
-        trial_by_variant[variant] += 1
-        trial = trial_by_variant[variant]
-        print(f"{variant},{trial},{nx},{ny},{nranks},{nsteps},{wall_time:.6f}")
+    print("variant,trial,nx,ny,nranks,nsteps,omp_threads,wall_time_s")
+    trial_by_series = defaultdict(int)
+    for run in parsed_runs:
+        variant = run["variant"]
+        threads = run["threads"]
+        if threads <= 0:
+            threads = 1
+        label = series_label(variant, threads)
+        nx = "" if run["nx"] < 0 else str(run["nx"])
+        ny = "" if run["ny"] < 0 else str(run["ny"])
+        nranks = "" if run["nranks"] < 0 else str(run["nranks"])
+        nsteps = "" if run["nsteps"] < 0 else str(run["nsteps"])
+        wall_time = run["wall_time_s"]
+        trial_by_series[label] += 1
+        trial = trial_by_series[label]
+        print(f"{variant},{trial},{nx},{ny},{nranks},{nsteps},{threads},{wall_time:.6f}")
+
+
+def plot_scaling_comparison(parsed_runs: list, save_prefix: str) -> None:
+    """
+    Plot grouped scaling comparisons:
+    - Top: runtime vs nx for each variant (mean + min/max band)
+    - Bottom: speedup over serial at matching nx
+    """
+    points = defaultdict(lambda: defaultdict(list))
+    for run in parsed_runs:
+        nx = run["nx"]
+        if nx <= 0:
+            continue
+        threads = run["threads"]
+        if threads <= 0:
+            threads = 1
+        label = series_label(run["variant"], threads)
+        points[label][nx].append(run["wall_time_s"])
+
+    if not points:
+        print("No plotting points with valid nx values were found.")
+        return
+
+    variants = sorted(points.keys())
+    serial_key = "serial" if "serial" in points else None
+
+    stats = {}
+    for variant in variants:
+        nx_vals = sorted(points[variant].keys())
+        means = np.array([float(np.mean(points[variant][nx])) for nx in nx_vals], dtype=float)
+        mins = np.array([float(np.min(points[variant][nx])) for nx in nx_vals], dtype=float)
+        maxs = np.array([float(np.max(points[variant][nx])) for nx in nx_vals], dtype=float)
+        stats[variant] = {
+            "nx": np.array(nx_vals, dtype=float),
+            "mean": means,
+            "min": mins,
+            "max": maxs,
+        }
+
+    fig, (ax_runtime, ax_speedup) = plt.subplots(2, 1, figsize=(10, 9), sharex=True)
+
+    for variant in variants:
+        st = stats[variant]
+        ax_runtime.plot(st["nx"], st["mean"], marker="o", linewidth=2, label=variant)
+        ax_runtime.fill_between(st["nx"], st["min"], st["max"], alpha=0.18)
+
+    ax_runtime.set_xscale("log", base=2)
+    ax_runtime.set_yscale("log")
+    ax_runtime.set_ylabel("Wall time (s)")
+    ax_runtime.set_title("Scaling Comparison by Version / Thread Count")
+    ax_runtime.grid(True, which="both", linestyle="--", alpha=0.4)
+    ax_runtime.legend()
+
+    if serial_key is not None:
+        serial_means = {
+            int(nx): float(mean)
+            for nx, mean in zip(stats[serial_key]["nx"], stats[serial_key]["mean"])
+        }
+        for variant in variants:
+            st = stats[variant]
+            common_nx = [int(nx) for nx in st["nx"] if int(nx) in serial_means]
+            if not common_nx:
+                continue
+            speedups = []
+            for nx in common_nx:
+                variant_mean = float(np.mean(points[variant][nx]))
+                speedups.append(serial_means[nx] / max(variant_mean, 1e-12))
+            ax_speedup.plot(
+                np.array(common_nx, dtype=float),
+                np.array(speedups, dtype=float),
+                marker="o",
+                linewidth=2,
+                label=variant,
+            )
+        ax_speedup.axhline(1.0, color="k", linestyle="--", linewidth=1)
+        ax_speedup.set_ylabel("Speedup vs serial")
+        ax_speedup.set_title("Relative Speedup vs serial (higher is better)")
+        ax_speedup.grid(True, which="both", linestyle="--", alpha=0.4)
+        ax_speedup.legend()
+    else:
+        ax_speedup.text(
+            0.5,
+            0.5,
+            "Serial baseline not present in CSV.",
+            transform=ax_speedup.transAxes,
+            ha="center",
+            va="center",
+        )
+        ax_speedup.set_axis_off()
+
+    all_nx = sorted({int(nx) for variant in variants for nx in stats[variant]["nx"]})
+    ax_speedup.set_xscale("log", base=2)
+    ax_speedup.set_xlabel("Grid size nx (= ny)")
+    ax_speedup.set_xticks(all_nx)
+    ax_speedup.set_xticklabels([str(nx) for nx in all_nx])
+
+    plt.tight_layout()
+
+    if save_prefix:
+        png_path = f"{save_prefix}.png"
+        pdf_path = f"{save_prefix}.pdf"
+        fig.savefig(png_path, dpi=200, bbox_inches="tight")
+        fig.savefig(pdf_path, bbox_inches="tight")
+        print(f"Saved {png_path} and {pdf_path}")
+
+    plt.show()
 
 
 def parse_metadata(metadata_path: str) -> dict:
@@ -484,6 +639,16 @@ def main() -> None:
     parser.add_argument("--outdir", default="results")
     parser.add_argument("--cmap", default="inferno")
     parser.add_argument(
+        "--no-scaling-plot",
+        action="store_true",
+        help="Print scaling summary only (do not open plotting figure).",
+    )
+    parser.add_argument(
+        "--scaling-save-prefix",
+        default="",
+        help="If set, save scaling figure to <prefix>.png and <prefix>.pdf.",
+    )
+    parser.add_argument(
         "--step",
         type=int,
         default=-1,
@@ -527,7 +692,10 @@ def main() -> None:
 
     if args.mode == "scaling":
         csv_path = resolve_scaling_csv(args.csv, args.ask_csv)
-        summarize_scaling(csv_path)
+        runs = load_scaling_runs(csv_path)
+        summarize_scaling_runs(runs, csv_path)
+        if not args.no_scaling_plot:
+            plot_scaling_comparison(runs, args.scaling_save_prefix)
     elif args.mode == "heatmap":
         outdir = resolve_heatmap_outdir(args.outdir, args.ask_outdir)
         show_heatmap_slider(outdir, args.cmap)

@@ -29,12 +29,15 @@ NY ?= 4096
 NSTEPS ?= 10000
 TILE_WIDTH ?= 16
 ARCH ?= sm_80
-SCALING_NX_LIST ?= 1024 2048 4096
-# 1 + (4900 / 100) = 50 snapshot times per scaling run (step 0..4900).
-SCALING_STEPS ?= 4900
-SCALING_SNAP_EVERY ?= 100
+# 2^9 .. 2^16 problem sizes.
+SCALING_NX_LIST ?= 512 1024 2048 4096 8192 16384 32768 65536
+# Keep ~200 steps and write ~200 snapshots for temporal accuracy checks.
+SCALING_STEPS ?= 200
+SCALING_SNAP_EVERY ?= 1
 SCALING_MPI_NP ?= 2
 SCALING_VARIANTS ?= serial omp cuda hybrid
+# Sweep OMP thread count for omp/hybrid variants.
+SCALING_THREADS_LIST ?= 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32
 
 COMMON_DEFS = -DNX_DEFAULT=$(NX) -DNY_DEFAULT=$(NY) -DNSTEPS_DEFAULT=$(NSTEPS)
 OPT = -O3
@@ -106,26 +109,34 @@ stencil_cuda.hybrid.o: stencil_cuda.cu heat.h
 scaling-study:
 	@mkdir -p results
 	@if [ ! -f results/scaling.csv ]; then \
-		echo "version,nx,ny,nranks,nsteps,wall_time_s" > results/scaling.csv; \
+		echo "version,nx,ny,nranks,nsteps,wall_time_s,omp_threads" > results/scaling.csv; \
 	fi
 	@for nx in $(SCALING_NX_LIST); do \
 		for variant in $(SCALING_VARIANTS); do \
 			case "$$variant" in \
 				serial) \
 					$(MAKE) --no-print-directory heat_serial; \
-					./heat_serial --nx $$nx --ny $$nx --steps $(SCALING_STEPS) --snap-every $(SCALING_SNAP_EVERY) --outdir results/scaling_serial_nx$$nx >> results/scaling.csv; \
+					line=$$(./heat_serial --nx $$nx --ny $$nx --steps $(SCALING_STEPS) --snap-every $(SCALING_SNAP_EVERY) --outdir results/scaling_serial_nx$$nx); \
+					echo "$$line,1" >> results/scaling.csv; \
 					;; \
 				omp) \
 					$(MAKE) --no-print-directory heat_omp; \
-					./heat_omp --nx $$nx --ny $$nx --steps $(SCALING_STEPS) --snap-every $(SCALING_SNAP_EVERY) --outdir results/scaling_omp_nx$$nx >> results/scaling.csv; \
+					for t in $(SCALING_THREADS_LIST); do \
+						line=$$(OMP_NUM_THREADS=$$t ./heat_omp --nx $$nx --ny $$nx --steps $(SCALING_STEPS) --snap-every $(SCALING_SNAP_EVERY) --outdir results/scaling_omp_nx$${nx}_t$${t}); \
+						echo "$$line,$$t" >> results/scaling.csv; \
+					done; \
 					;; \
 				cuda) \
 					$(MAKE) --no-print-directory heat_cuda; \
-					./heat_cuda --nx $$nx --ny $$nx --steps $(SCALING_STEPS) --snap-every $(SCALING_SNAP_EVERY) --outdir results/scaling_cuda_nx$$nx >> results/scaling.csv; \
+					line=$$(./heat_cuda --nx $$nx --ny $$nx --steps $(SCALING_STEPS) --snap-every $(SCALING_SNAP_EVERY) --outdir results/scaling_cuda_nx$$nx); \
+					echo "$$line,1" >> results/scaling.csv; \
 					;; \
 				hybrid) \
 					$(MAKE) --no-print-directory heat_hybrid; \
-					mpirun --mca btl ^openib -np $(SCALING_MPI_NP) ./heat_hybrid --nx $$nx --ny $$nx --steps $(SCALING_STEPS) --snap-every $(SCALING_SNAP_EVERY) --outdir results/scaling_hybrid_nx$$nx >> results/scaling.csv; \
+					for t in $(SCALING_THREADS_LIST); do \
+						line=$$(OMP_NUM_THREADS=$$t mpirun --mca btl ^openib -np $(SCALING_MPI_NP) ./heat_hybrid --nx $$nx --ny $$nx --steps $(SCALING_STEPS) --snap-every $(SCALING_SNAP_EVERY) --outdir results/scaling_hybrid_nx$${nx}_t$${t}); \
+						echo "$$line,$$t" >> results/scaling.csv; \
+					done; \
 					;; \
 				*) \
 					echo "Unknown variant '$$variant'. Use serial/omp/cuda/hybrid."; \
