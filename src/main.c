@@ -1,5 +1,4 @@
 #include "heat.h"
-
 #include <errno.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -98,43 +97,12 @@ static void assign_materials(Grid *g, int global_ny_start)
 
 static void set_initial_condition(Grid *g, int global_ny_start)
 {
+    (void)global_ny_start;
     /* Start the full local slab (including ghost rows) at ambient temperature. */
     int nxy = g->nx * (g->local_ny + 2);
     for (int idx = 0; idx < nxy; idx++) {
         g->T_old[idx] = T_AMBIENT;
         g->T_new[idx] = T_AMBIENT;
-    }
-
-    /*
-     * Add three Gaussian hot spots in the die region.
-     * These emulate concentrated transistor clusters on the silicon layer.
-     */
-    float sigma = (float)g->nx / 40.0f;
-    float two_sigma2 = 2.0f * sigma * sigma;
-    float cx0 = (float)g->nx * 0.25f;
-    float cx1 = (float)g->nx * 0.50f;
-    float cx2 = (float)g->nx * 0.75f;
-    float cy = (float)g->ny * 0.80f;
-    int silicon_start = (int)(0.55f * (float)g->ny);
-
-    for (int j = 1; j <= g->local_ny; j++) {
-        int gy = global_ny_start + (j - 1);
-        if (gy < silicon_start) {
-            continue;
-        }
-
-        for (int i = 0; i < g->nx; i++) {
-            float dx0 = (float)i - cx0;
-            float dx1 = (float)i - cx1;
-            float dx2 = (float)i - cx2;
-            float dy0 = (float)gy - cy;
-            float add0 = 50.0f * expf(-(dx0 * dx0 + dy0 * dy0) / two_sigma2);
-            float add1 = 50.0f * expf(-(dx1 * dx1 + dy0 * dy0) / two_sigma2);
-            float add2 = 50.0f * expf(-(dx2 * dx2 + dy0 * dy0) / two_sigma2);
-            float t = T_AMBIENT + add0 + add1 + add2;
-            g->T_old[IDX(g, i, j)] = t;
-            g->T_new[IDX(g, i, j)] = t;
-        }
     }
 }
 
@@ -161,6 +129,7 @@ static void grid_init(Grid *g, int nx, int ny, int rank, int nranks)
         g->local_ny = base;
         global_ny_start = rem * (base + 1) + (rank - rem) * base;
     }
+    g->global_y_start = global_ny_start;
 
     /* Uniform spacing in both directions for this project phase. */
     g->dx = 1.0e-5f;

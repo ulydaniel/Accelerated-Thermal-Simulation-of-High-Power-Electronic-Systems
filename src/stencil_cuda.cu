@@ -17,7 +17,8 @@ static float *d_rhocp_tbl = NULL;
 __global__ void stencil_kernel_naive(const float *T_old, float *T_new,
                                      const int *material_id,
                                      const float *kx_tbl, const float *ky_tbl,
-                                     const float *rhocp_tbl, int nx, int local_ny,
+                                     const float *rhocp_tbl, int nx, int ny,
+                                     int local_ny, int global_y_start,
                                      float dx, float dy, float dt)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -28,11 +29,29 @@ __global__ void stencil_kernel_naive(const float *T_old, float *T_new,
     }
 
     int m = material_id[j];
+    int gy = global_y_start + (j - 1);
     float kx = kx_tbl[m];
     float ky = ky_tbl[m];
     float rhocp = rhocp_tbl[m];
     float ax = kx / rhocp;
     float ay = ky / rhocp;
+    float qdot = 0.0f;
+    if (m == MAT_SILICON) {
+        float sigma = (float)nx * HOTSPOT_SIGMA_FRAC;
+        float two_sigma2 = 2.0f * sigma * sigma;
+        float cx0 = 0.25f * (float)nx;
+        float cx1 = 0.50f * (float)nx;
+        float cx2 = 0.75f * (float)nx;
+        float cy = HOTSPOT_Y_FRAC * (float)ny;
+        float dy0 = (float)gy - cy;
+        float dx0 = (float)i - cx0;
+        float dx1 = (float)i - cx1;
+        float dx2 = (float)i - cx2;
+        qdot = HOTSPOT_POWER_PEAK *
+               (expf(-(dx0 * dx0 + dy0 * dy0) / two_sigma2) +
+                expf(-(dx1 * dx1 + dy0 * dy0) / two_sigma2) +
+                expf(-(dx2 * dx2 + dy0 * dy0) / two_sigma2));
+    }
 
     int idx = j * nx + i;
     float c = T_old[idx];
@@ -42,7 +61,8 @@ __global__ void stencil_kernel_naive(const float *T_old, float *T_new,
     float w = T_old[j * nx + (i - 1)];
 
     T_new[idx] = c + dt * (ax * (e - 2.0f * c + w) / (dx * dx) +
-                           ay * (n - 2.0f * c + s) / (dy * dy));
+                           ay * (n - 2.0f * c + s) / (dy * dy) +
+                           qdot / rhocp);
 }
 
 /*
@@ -54,7 +74,8 @@ __global__ void stencil_kernel_naive(const float *T_old, float *T_new,
 __global__ void stencil_kernel_tiled(const float *T_old, float *T_new,
                                      const int *material_id,
                                      const float *kx_tbl, const float *ky_tbl,
-                                     const float *rhocp_tbl, int nx, int local_ny,
+                                     const float *rhocp_tbl, int nx, int ny,
+                                     int local_ny, int global_y_start,
                                      float dx, float dy, float dt)
 {
     __shared__ float tile[TILE_WIDTH + 2][TILE_WIDTH + 2];
@@ -139,11 +160,29 @@ __global__ void stencil_kernel_tiled(const float *T_old, float *T_new,
     }
 
     int m = material_id[j];
+    int gy = global_y_start + (j - 1);
     float kx = kx_tbl[m];
     float ky = ky_tbl[m];
     float rhocp = rhocp_tbl[m];
     float ax = kx / rhocp;
     float ay = ky / rhocp;
+    float qdot = 0.0f;
+    if (m == MAT_SILICON) {
+        float sigma = (float)nx * HOTSPOT_SIGMA_FRAC;
+        float two_sigma2 = 2.0f * sigma * sigma;
+        float cx0 = 0.25f * (float)nx;
+        float cx1 = 0.50f * (float)nx;
+        float cx2 = 0.75f * (float)nx;
+        float cy = HOTSPOT_Y_FRAC * (float)ny;
+        float dy0 = (float)gy - cy;
+        float dx0 = (float)i - cx0;
+        float dx1 = (float)i - cx1;
+        float dx2 = (float)i - cx2;
+        qdot = HOTSPOT_POWER_PEAK *
+               (expf(-(dx0 * dx0 + dy0 * dy0) / two_sigma2) +
+                expf(-(dx1 * dx1 + dy0 * dy0) / two_sigma2) +
+                expf(-(dx2 * dx2 + dy0 * dy0) / two_sigma2));
+    }
 
     float c = tile[ty + 1][tx + 1];
     float n = tile[ty + 2][tx + 1];
@@ -152,7 +191,8 @@ __global__ void stencil_kernel_tiled(const float *T_old, float *T_new,
     float w = tile[ty + 1][tx];
 
     T_new[j * nx + i] = c + dt * (ax * (e - 2.0f * c + w) / (dx * dx) +
-                                  ay * (n - 2.0f * c + s) / (dy * dy));
+                                  ay * (n - 2.0f * c + s) / (dy * dy) +
+                                  qdot / rhocp);
 }
 
 /* Allocate and upload all GPU-side buffers used during time stepping. */
@@ -216,11 +256,13 @@ extern "C" void launch_stencil_cuda(Grid *g)
 #ifdef USE_NAIVE_KERNEL
     stencil_kernel_naive<<<grid, block>>>(g->d_T_old, g->d_T_new, d_material_id,
                                           d_kx_tbl, d_ky_tbl, d_rhocp_tbl,
-                                          g->nx, g->local_ny, g->dx, g->dy, g->dt);
+                                          g->nx, g->ny, g->local_ny,
+                                          g->global_y_start, g->dx, g->dy, g->dt);
 #else
     stencil_kernel_tiled<<<grid, block>>>(g->d_T_old, g->d_T_new, d_material_id,
                                           d_kx_tbl, d_ky_tbl, d_rhocp_tbl,
-                                          g->nx, g->local_ny, g->dx, g->dy, g->dt);
+                                          g->nx, g->ny, g->local_ny,
+                                          g->global_y_start, g->dx, g->dy, g->dt);
 #endif
     CUDA_CHECK(cudaGetLastError());
 }

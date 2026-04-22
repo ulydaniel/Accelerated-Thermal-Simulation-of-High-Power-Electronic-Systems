@@ -145,7 +145,6 @@ scaling-study:
 			esac; \
 		done; \
 	done
-	$(PYTHON) visualize.py --mode scaling
 
 # Remove generated binaries and object files.
 clean:

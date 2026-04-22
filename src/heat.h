@@ -38,6 +38,15 @@
 #ifndef T_AMBIENT
 #define T_AMBIENT 300.0f
 #endif
+#ifndef HOTSPOT_POWER_PEAK
+#define HOTSPOT_POWER_PEAK 2.0e11f
+#endif
+#ifndef HOTSPOT_SIGMA_FRAC
+#define HOTSPOT_SIGMA_FRAC 0.025f
+#endif
+#ifndef HOTSPOT_Y_FRAC
+#define HOTSPOT_Y_FRAC 0.80f
+#endif
 
 /* Layer ids from bottom (PCB side) to top (die side). */
 #define NUM_MATERIALS 4
@@ -64,6 +73,7 @@ typedef struct {
     int nx;              /* Global X dimension. */
     int ny;              /* Global Y dimension. */
     int local_ny;        /* Local Y rows owned by this rank. */
+    int global_y_start;  /* Global Y index of first owned physical row. */
     int rank;            /* MPI rank id. */
     int nranks;          /* Number of MPI ranks. */
     float dx;            /* Cell spacing in X. */
