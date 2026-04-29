@@ -35,6 +35,12 @@
 #ifndef TILE_WIDTH
 #define TILE_WIDTH 16
 #endif
+#ifndef BLOCK_X_DEFAULT
+#define BLOCK_X_DEFAULT TILE_WIDTH
+#endif
+#ifndef BLOCK_Y_DEFAULT
+#define BLOCK_Y_DEFAULT TILE_WIDTH
+#endif
 #ifndef T_AMBIENT
 #define T_AMBIENT 300.0f
 #endif
@@ -84,6 +90,8 @@ typedef struct {
     float *d_T_old;      /* Device input temperature field. */
     float *d_T_new;      /* Device output temperature field. */
     int *material_id;    /* Material id per cell. */
+    int block_x;         /* CUDA block dimension in X. */
+    int block_y;         /* CUDA block dimension in Y. */
 } Grid;
 
 /* Per-material property tables (defined in stencil_cpu.c). */

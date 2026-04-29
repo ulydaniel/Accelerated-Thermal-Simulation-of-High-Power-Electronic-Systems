@@ -3,6 +3,16 @@
 #include <sys/stat.h>
 #include <time.h>
 
+/*
+ * main.c is the top-level driver for the project solver:
+ * - Builds a 2D anisotropic heat diffusion run over a multi-layer IC package.
+ * - Decomposes the global grid into Y-slabs (one slab per MPI rank).
+ * - Initializes material regions (FR4, copper, TIM, silicon) and temperatures.
+ * - Executes the timestep loop with serial/OMP/CUDA stencil backends.
+ * - Coordinates halo exchange across ranks and writes snapshots/metadata.
+ * - Reports parseable CSV timing output for benchmarking scripts.
+ */
+
 // === Section 1: Static helpers ===
 
 /*
@@ -10,12 +20,14 @@
  * We keep defaults in heat.h so Makefile flags and CLI flags can both control runs.
  */
 static void parse_args(int argc, char **argv, int *nx, int *ny, int *nsteps,
-                       int *snap_every, char **outdir)
+                       int *snap_every, int *block_x, int *block_y, char **outdir)
 {
     *nx = NX_DEFAULT;
     *ny = NY_DEFAULT;
     *nsteps = NSTEPS_DEFAULT;
     *snap_every = SNAP_EVERY_DEFAULT;
+    *block_x = BLOCK_X_DEFAULT;
+    *block_y = BLOCK_Y_DEFAULT;
     *outdir = (char *)"results";
 
     for (int i = 1; i < argc; i++) {
@@ -27,22 +39,44 @@ static void parse_args(int argc, char **argv, int *nx, int *ny, int *nsteps,
             *nsteps = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--snap-every") == 0 && i + 1 < argc) {
             *snap_every = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--block-x") == 0 && i + 1 < argc) {
+            *block_x = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--block-y") == 0 && i + 1 < argc) {
+            *block_y = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--outdir") == 0 && i + 1 < argc) {
             *outdir = argv[++i];
         } else {
             fprintf(stderr,
-                    "Usage: %s [--nx N] [--ny N] [--steps N] [--snap-every N] [--outdir PATH]\n",
+                    "Usage: %s [--nx N] [--ny N] [--steps N] [--snap-every N] [--block-x N] [--block-y N] [--outdir PATH]\n",
                     argv[0]);
             exit(EXIT_FAILURE);
         }
     }
 
-    if (*nx < 3 || *ny < 1 || *nsteps < 1 || *snap_every < 1) {
-        fprintf(stderr, "Invalid args: nx>=3 ny>=1 steps>=1 snap-every>=1 required.\n");
+    if (*nx < 3 || *ny < 1 || *nsteps < 1 || *snap_every < 1 || *block_x < 1 || *block_y < 1) {
+        fprintf(stderr, "Invalid args: nx>=3 ny>=1 steps>=1 snap-every>=1 block-x>=1 block-y>=1 required.\n");
         exit(EXIT_FAILURE);
     }
 }
 
+static FILE *open_file_portable(const char *path, const char *mode)
+{
+#if defined(_MSC_VER)
+    FILE *fp = NULL;
+    errno_t err = fopen_s(&fp, path, mode);
+    if (err != 0) {
+        return NULL;
+    }
+    return fp;
+#else
+    return fopen(path, mode);
+#endif
+}
+
+/*
+ * Computes an explicit-method stable timestep based on the maximum directional
+ * thermal diffusivity across all package materials used by this project.
+ */
 static float compute_dt(float dx, float dy)
 {
     /* Conservative CFL: use the largest diffusivity across all materials/directions. */
@@ -61,6 +95,10 @@ static float compute_dt(float dx, float dy)
     return 0.24f / (alpha_max * (1.0f / (dx * dx) + 1.0f / (dy * dy)));
 }
 
+/*
+ * Assigns each local row to an IC-package layer (FR4/copper/TIM/silicon) using
+ * global Y position, so stencil updates apply anisotropic material properties.
+ */
 static void assign_materials(Grid *g, int global_ny_start)
 {
     /*
@@ -95,6 +133,10 @@ static void assign_materials(Grid *g, int global_ny_start)
     }
 }
 
+/*
+ * Initializes the rank-local temperature field (including ghost rows) to the
+ * project ambient baseline before diffusion timesteps begin.
+ */
 static void set_initial_condition(Grid *g, int global_ny_start)
 {
     (void)global_ny_start;
@@ -108,6 +150,13 @@ static void set_initial_condition(Grid *g, int global_ny_start)
 
 // === Section 2: Grid lifecycle ===
 
+/*
+ * Initializes one rank's slab of the global domain:
+ * - computes 1D Y decomposition metadata,
+ * - allocates host storage,
+ * - sets spatial/temporal discretization,
+ * - builds material map and initial state.
+ */
 static void grid_init(Grid *g, int nx, int ny, int rank, int nranks)
 {
     /* 1D slab decomposition along Y (each rank gets a contiguous row range). */
@@ -157,6 +206,9 @@ static void grid_init(Grid *g, int nx, int ny, int rank, int nranks)
     set_initial_condition(g, global_ny_start);
 }
 
+/*
+ * Releases host-side slab allocations for this rank.
+ */
 static void grid_free(Grid *g)
 {
     free(g->T_old);
@@ -167,6 +219,10 @@ static void grid_free(Grid *g)
     g->material_id = NULL;
 }
 
+/*
+ * Swaps old/new temperature buffers after each timestep ("ping-pong" scheme),
+ * keeping host and device pointers aligned in CUDA builds.
+ */
 static void grid_swap(Grid *g)
 {
     /* Ping-pong host buffers after each step. */
@@ -183,6 +239,10 @@ static void grid_swap(Grid *g)
 
 // === Section 3: I/O ===
 
+/*
+ * Ensures the output directory exists so metadata and per-rank snapshots can
+ * be emitted for post-processing and visualization.
+ */
 static void make_outdir(const char *path)
 {
     /* Ignore "already exists" so reruns append/overwrite snapshots naturally. */
@@ -192,6 +252,10 @@ static void make_outdir(const char *path)
     }
 }
 
+/*
+ * Writes one run metadata file (rank 0 only) so downstream analysis can
+ * reconstruct physical and numerical parameters of a simulation.
+ */
 static void write_metadata(Grid *g, int nsteps, int snap_every, const char *outdir)
 {
     /* Single metadata file is written by rank 0 only. */
@@ -202,7 +266,7 @@ static void write_metadata(Grid *g, int nsteps, int snap_every, const char *outd
     char fname[512];
     snprintf(fname, sizeof(fname), "%s/metadata.txt", outdir);
 
-    FILE *fp = fopen(fname, "w");
+    FILE *fp = open_file_portable(fname, "w");
     if (fp == NULL) {
         fprintf(stderr, "Failed to open %s for writing.\n", fname);
         return;
@@ -216,9 +280,15 @@ static void write_metadata(Grid *g, int nsteps, int snap_every, const char *outd
     fprintf(fp, "dt=%.9e\n", g->dt);
     fprintf(fp, "nsteps=%d\n", nsteps);
     fprintf(fp, "snap_every=%d\n", snap_every);
+    fprintf(fp, "block_x=%d\n", g->block_x);
+    fprintf(fp, "block_y=%d\n", g->block_y);
     fclose(fp);
 }
 
+/*
+ * Dumps the rank-owned physical rows (excluding ghost rows) as a binary
+ * snapshot; this is used to assemble full-field temperature evolution.
+ */
 static void write_snapshot(Grid *g, int step, const char *outdir)
 {
 #ifdef USE_CUDA
@@ -229,7 +299,7 @@ static void write_snapshot(Grid *g, int step, const char *outdir)
     char fname[512];
     snprintf(fname, sizeof(fname), "%s/rank_%03d_step_%06d.bin", outdir, g->rank, step);
 
-    FILE *fp = fopen(fname, "wb");
+    FILE *fp = open_file_portable(fname, "wb");
     if (fp == NULL) {
         fprintf(stderr, "Rank %d: failed to open %s for writing.\n", g->rank, fname);
         return;
@@ -250,6 +320,12 @@ static void write_snapshot(Grid *g, int step, const char *outdir)
 
 // === Section 4: main() ===
 
+/*
+ * Orchestrates the complete simulation workflow:
+ * argument parsing, runtime init (MPI/CUDA), grid setup, timestep loop,
+ * optional halo exchange, snapshotting, timing reduction, CSV reporting,
+ * and ordered cleanup.
+ */
 int main(int argc, char **argv)
 {
     Grid g;
@@ -257,6 +333,8 @@ int main(int argc, char **argv)
     int ny;
     int nsteps;
     int snap_every;
+    int block_x;
+    int block_y;
     char *outdir;
     int rank = 0;
     int nranks = 1;
@@ -265,7 +343,7 @@ int main(int argc, char **argv)
     double elapsed;
     double wall_time;
 
-    parse_args(argc, argv, &nx, &ny, &nsteps, &snap_every, &outdir);
+    parse_args(argc, argv, &nx, &ny, &nsteps, &snap_every, &block_x, &block_y, &outdir);
 
     /* Initialize distributed runtime only when MPI build is enabled. */
 #ifdef USE_MPI
@@ -291,9 +369,28 @@ int main(int argc, char **argv)
 #endif
 
     grid_init(&g, nx, ny, rank, nranks);
+    g.block_x = block_x;
+    g.block_y = block_y;
 
     /* Allocate optional accelerator / communication resources. */
 #ifdef USE_CUDA
+    {
+        cudaDeviceProp prop;
+        int device_id = 0;
+        CUDA_CHECK(cudaGetDevice(&device_id));
+        CUDA_CHECK(cudaGetDeviceProperties(&prop, device_id));
+        if (g.block_x > prop.maxThreadsDim[0] || g.block_y > prop.maxThreadsDim[1] ||
+            g.block_x * g.block_y > prop.maxThreadsPerBlock) {
+            fprintf(stderr,
+                    "Invalid CUDA block: %d x %d (device max dim %d x %d, max threads %d)\n",
+                    g.block_x, g.block_y, prop.maxThreadsDim[0], prop.maxThreadsDim[1],
+                    prop.maxThreadsPerBlock);
+#ifdef USE_MPI
+            MPI_Finalize();
+#endif
+            return EXIT_FAILURE;
+        }
+    }
     cuda_alloc(&g);
 #endif
 #ifdef USE_MPI

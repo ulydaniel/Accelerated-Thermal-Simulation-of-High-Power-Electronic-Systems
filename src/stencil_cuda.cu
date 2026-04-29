@@ -78,47 +78,49 @@ __global__ void stencil_kernel_tiled(const float *T_old, float *T_new,
                                      int local_ny, int global_y_start,
                                      float dx, float dy, float dt)
 {
-    __shared__ float tile[TILE_WIDTH + 2][TILE_WIDTH + 2];
+    extern __shared__ float tile[];
+    int tile_pitch = blockDim.x + 2;
 
     int tx = threadIdx.x;
     int ty = threadIdx.y;
     int i = blockIdx.x * blockDim.x + tx;
     int j = blockIdx.y * blockDim.y + ty + 1;
+    int center = (ty + 1) * tile_pitch + (tx + 1);
 
     /* Center load for each thread. */
     if (i >= 0 && i < nx && j >= 0 && j <= local_ny + 1) {
-        tile[ty + 1][tx + 1] = T_old[j * nx + i];
+        tile[center] = T_old[j * nx + i];
     } else {
-        tile[ty + 1][tx + 1] = T_AMBIENT;
+        tile[center] = T_AMBIENT;
     }
 
     /* Halo loads: each edge thread pulls one extra neighbor cell. */
     if (tx == 0) {
         if (i - 1 >= 0 && j >= 0 && j <= local_ny + 1) {
-            tile[ty + 1][0] = T_old[j * nx + (i - 1)];
+            tile[(ty + 1) * tile_pitch] = T_old[j * nx + (i - 1)];
         } else {
-            tile[ty + 1][0] = T_AMBIENT;
+            tile[(ty + 1) * tile_pitch] = T_AMBIENT;
         }
     }
-    if (tx == TILE_WIDTH - 1) {
+    if (tx == blockDim.x - 1) {
         if (i + 1 < nx && j >= 0 && j <= local_ny + 1) {
-            tile[ty + 1][TILE_WIDTH + 1] = T_old[j * nx + (i + 1)];
+            tile[(ty + 1) * tile_pitch + (blockDim.x + 1)] = T_old[j * nx + (i + 1)];
         } else {
-            tile[ty + 1][TILE_WIDTH + 1] = T_AMBIENT;
+            tile[(ty + 1) * tile_pitch + (blockDim.x + 1)] = T_AMBIENT;
         }
     }
     if (ty == 0) {
         if (j - 1 >= 0 && i >= 0 && i < nx) {
-            tile[0][tx + 1] = T_old[(j - 1) * nx + i];
+            tile[tx + 1] = T_old[(j - 1) * nx + i];
         } else {
-            tile[0][tx + 1] = T_AMBIENT;
+            tile[tx + 1] = T_AMBIENT;
         }
     }
-    if (ty == TILE_WIDTH - 1) {
+    if (ty == blockDim.y - 1) {
         if (j + 1 <= local_ny + 1 && i >= 0 && i < nx) {
-            tile[TILE_WIDTH + 1][tx + 1] = T_old[(j + 1) * nx + i];
+            tile[(blockDim.y + 1) * tile_pitch + (tx + 1)] = T_old[(j + 1) * nx + i];
         } else {
-            tile[TILE_WIDTH + 1][tx + 1] = T_AMBIENT;
+            tile[(blockDim.y + 1) * tile_pitch + (tx + 1)] = T_AMBIENT;
         }
     }
 
@@ -130,25 +132,25 @@ __global__ void stencil_kernel_tiled(const float *T_old, float *T_new,
             tile[0][0] = T_AMBIENT;
         }
     }
-    if (tx == TILE_WIDTH - 1 && ty == 0) {
+    if (tx == blockDim.x - 1 && ty == 0) {
         if (i + 1 < nx && j - 1 >= 0) {
-            tile[0][TILE_WIDTH + 1] = T_old[(j - 1) * nx + (i + 1)];
+            tile[blockDim.x + 1] = T_old[(j - 1) * nx + (i + 1)];
         } else {
-            tile[0][TILE_WIDTH + 1] = T_AMBIENT;
+            tile[blockDim.x + 1] = T_AMBIENT;
         }
     }
-    if (tx == 0 && ty == TILE_WIDTH - 1) {
+    if (tx == 0 && ty == blockDim.y - 1) {
         if (i - 1 >= 0 && j + 1 <= local_ny + 1) {
-            tile[TILE_WIDTH + 1][0] = T_old[(j + 1) * nx + (i - 1)];
+            tile[(blockDim.y + 1) * tile_pitch] = T_old[(j + 1) * nx + (i - 1)];
         } else {
-            tile[TILE_WIDTH + 1][0] = T_AMBIENT;
+            tile[(blockDim.y + 1) * tile_pitch] = T_AMBIENT;
         }
     }
-    if (tx == TILE_WIDTH - 1 && ty == TILE_WIDTH - 1) {
+    if (tx == blockDim.x - 1 && ty == blockDim.y - 1) {
         if (i + 1 < nx && j + 1 <= local_ny + 1) {
-            tile[TILE_WIDTH + 1][TILE_WIDTH + 1] = T_old[(j + 1) * nx + (i + 1)];
+            tile[(blockDim.y + 1) * tile_pitch + (blockDim.x + 1)] = T_old[(j + 1) * nx + (i + 1)];
         } else {
-            tile[TILE_WIDTH + 1][TILE_WIDTH + 1] = T_AMBIENT;
+            tile[(blockDim.y + 1) * tile_pitch + (blockDim.x + 1)] = T_AMBIENT;
         }
     }
 
@@ -184,11 +186,11 @@ __global__ void stencil_kernel_tiled(const float *T_old, float *T_new,
                 expf(-(dx2 * dx2 + dy0 * dy0) / two_sigma2));
     }
 
-    float c = tile[ty + 1][tx + 1];
-    float n = tile[ty + 2][tx + 1];
-    float s = tile[ty][tx + 1];
-    float e = tile[ty + 1][tx + 2];
-    float w = tile[ty + 1][tx];
+    float c = tile[(ty + 1) * tile_pitch + (tx + 1)];
+    float n = tile[(ty + 2) * tile_pitch + (tx + 1)];
+    float s = tile[ty * tile_pitch + (tx + 1)];
+    float e = tile[(ty + 1) * tile_pitch + (tx + 2)];
+    float w = tile[(ty + 1) * tile_pitch + tx];
 
     T_new[j * nx + i] = c + dt * (ax * (e - 2.0f * c + w) / (dx * dx) +
                                   ay * (n - 2.0f * c + s) / (dy * dy) +
@@ -249,9 +251,10 @@ extern "C" void cuda_free(Grid *g)
 /* Launch one stencil step on GPU (sync handled by caller in main loop). */
 extern "C" void launch_stencil_cuda(Grid *g)
 {
-    dim3 block(TILE_WIDTH, TILE_WIDTH);
-    dim3 grid((g->nx + TILE_WIDTH - 1) / TILE_WIDTH,
-              (g->local_ny + TILE_WIDTH - 1) / TILE_WIDTH);
+    dim3 block((unsigned int)g->block_x, (unsigned int)g->block_y);
+    dim3 grid((g->nx + g->block_x - 1) / g->block_x,
+              (g->local_ny + g->block_y - 1) / g->block_y);
+    size_t shared_bytes = (size_t)(g->block_x + 2) * (size_t)(g->block_y + 2) * sizeof(float);
 
 #ifdef USE_NAIVE_KERNEL
     stencil_kernel_naive<<<grid, block>>>(g->d_T_old, g->d_T_new, d_material_id,
@@ -259,10 +262,10 @@ extern "C" void launch_stencil_cuda(Grid *g)
                                           g->nx, g->ny, g->local_ny,
                                           g->global_y_start, g->dx, g->dy, g->dt);
 #else
-    stencil_kernel_tiled<<<grid, block>>>(g->d_T_old, g->d_T_new, d_material_id,
-                                          d_kx_tbl, d_ky_tbl, d_rhocp_tbl,
-                                          g->nx, g->ny, g->local_ny,
-                                          g->global_y_start, g->dx, g->dy, g->dt);
+    stencil_kernel_tiled<<<grid, block, shared_bytes>>>(g->d_T_old, g->d_T_new, d_material_id,
+                                                         d_kx_tbl, d_ky_tbl, d_rhocp_tbl,
+                                                         g->nx, g->ny, g->local_ny,
+                                                         g->global_y_start, g->dx, g->dy, g->dt);
 #endif
     CUDA_CHECK(cudaGetLastError());
 }
