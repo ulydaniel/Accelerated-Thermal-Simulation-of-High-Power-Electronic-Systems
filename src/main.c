@@ -53,8 +53,8 @@ static void parse_args(int argc, char **argv, int *nx, int *ny, int *nsteps,
         }
     }
 
-    if (*nx < 3 || *ny < 1 || *nsteps < 1 || *snap_every < 1 || *block_x < 1 || *block_y < 1) {
-        fprintf(stderr, "Invalid args: nx>=3 ny>=1 steps>=1 snap-every>=1 block-x>=1 block-y>=1 required.\n");
+    if (*nx < 3 || *ny < 1 || *nsteps < 1 || *snap_every < 0 || *block_x < 1 || *block_y < 1) {
+        fprintf(stderr, "Invalid args: nx>=3 ny>=1 steps>=1 snap-every>=0 block-x>=1 block-y>=1 required.\n");
         exit(EXIT_FAILURE);
     }
 }
@@ -141,8 +141,8 @@ static void set_initial_condition(Grid *g, int global_ny_start)
 {
     (void)global_ny_start;
     /* Start the full local slab (including ghost rows) at ambient temperature. */
-    int nxy = g->nx * (g->local_ny + 2);
-    for (int idx = 0; idx < nxy; idx++) {
+    size_t nxy = (size_t)g->nx * (size_t)(g->local_ny + 2);
+    for (size_t idx = 0; idx < nxy; idx++) {
         g->T_old[idx] = T_AMBIENT;
         g->T_new[idx] = T_AMBIENT;
     }
@@ -163,7 +163,7 @@ static void grid_init(Grid *g, int nx, int ny, int rank, int nranks)
     int base = ny / nranks;
     int rem = ny % nranks;
     int global_ny_start;
-    int nxy;
+    size_t nxy;
 
     memset(g, 0, sizeof(*g));
     g->nx = nx;
@@ -185,9 +185,9 @@ static void grid_init(Grid *g, int nx, int ny, int rank, int nranks)
     g->dy = 1.0e-5f;
     g->dt = compute_dt(g->dx, g->dy);
 
-    nxy = g->nx * (g->local_ny + 2);
-    g->T_old = (float *)malloc((size_t)nxy * sizeof(float));
-    g->T_new = (float *)malloc((size_t)nxy * sizeof(float));
+    nxy = (size_t)g->nx * (size_t)(g->local_ny + 2);
+    g->T_old = (float *)malloc(nxy * sizeof(float));
+    g->T_new = (float *)malloc(nxy * sizeof(float));
     g->material_id = (int *)malloc((size_t)(g->local_ny + 2) * sizeof(int));
 
     if (g->T_old == NULL || g->T_new == NULL || g->material_id == NULL) {
@@ -375,7 +375,7 @@ int main(int argc, char **argv)
     /* Allocate optional accelerator / communication resources. */
 #ifdef USE_CUDA
     {
-        cudaDeviceProp prop;
+        struct cudaDeviceProp prop;
         int device_id = 0;
         CUDA_CHECK(cudaGetDevice(&device_id));
         CUDA_CHECK(cudaGetDeviceProperties(&prop, device_id));
@@ -399,7 +399,9 @@ int main(int argc, char **argv)
 
     make_outdir(outdir);
     write_metadata(&g, nsteps, snap_every, outdir);
-    write_snapshot(&g, 0, outdir);
+    if (snap_every > 0) {
+        write_snapshot(&g, 0, outdir);
+    }
 
     /* Start timing after all setup so runtime is pure simulation loop cost. */
 #ifdef USE_MPI
@@ -440,7 +442,7 @@ int main(int argc, char **argv)
         grid_swap(&g);
 
         /* Periodic snapshots for visualization and verification. */
-        if (step % snap_every == 0) {
+        if (snap_every > 0 && step % snap_every == 0) {
             write_snapshot(&g, step, outdir);
         }
     }

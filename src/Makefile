@@ -31,10 +31,12 @@ TILE_WIDTH ?= 16
 ARCH ?= sm_80
 # 2^9 .. 2^16 problem sizes.
 SCALING_NX_LIST ?= 512 1024 2048 4096 8192 16384 32768 65536
-# Keep ~200 steps and write ~200 snapshots for temporal accuracy checks.
+# For scaling runs, default to no snapshots to avoid massive I/O at large grids.
 SCALING_STEPS ?= 200
-SCALING_SNAP_EVERY ?= 1
+SCALING_SNAP_EVERY ?= 0
 SCALING_MPI_NP ?= 2
+SCALING_BLOCK_X ?= $(TILE_WIDTH)
+SCALING_BLOCK_Y ?= $(TILE_WIDTH)
 SCALING_VARIANTS ?= serial omp cuda hybrid
 # Sweep OMP thread count for omp/hybrid variants.
 SCALING_THREADS_LIST ?= 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32
@@ -109,33 +111,33 @@ stencil_cuda.hybrid.o: stencil_cuda.cu heat.h
 scaling-study:
 	@mkdir -p results
 	@if [ ! -f results/scaling.csv ]; then \
-		echo "version,nx,ny,nranks,nsteps,wall_time_s,omp_threads" > results/scaling.csv; \
+		echo "version,nx,ny,nranks,nsteps,wall_time_s,omp_threads,block_x,block_y" > results/scaling.csv; \
 	fi
 	@for nx in $(SCALING_NX_LIST); do \
 		for variant in $(SCALING_VARIANTS); do \
 			case "$$variant" in \
 				serial) \
-					$(MAKE) --no-print-directory heat_serial; \
+					$(MAKE) --no-print-directory heat_serial || exit $$?; \
 					line=$$(./heat_serial --nx $$nx --ny $$nx --steps $(SCALING_STEPS) --snap-every $(SCALING_SNAP_EVERY) --outdir results/scaling_serial_nx$$nx); \
-					echo "$$line,1" >> results/scaling.csv; \
+					echo "$$line,1,0,0" >> results/scaling.csv; \
 					;; \
 				omp) \
-					$(MAKE) --no-print-directory heat_omp; \
+					$(MAKE) --no-print-directory heat_omp || exit $$?; \
 					for t in $(SCALING_THREADS_LIST); do \
 						line=$$(OMP_NUM_THREADS=$$t ./heat_omp --nx $$nx --ny $$nx --steps $(SCALING_STEPS) --snap-every $(SCALING_SNAP_EVERY) --outdir results/scaling_omp_nx$${nx}_t$${t}); \
-						echo "$$line,$$t" >> results/scaling.csv; \
+						echo "$$line,$$t,0,0" >> results/scaling.csv; \
 					done; \
 					;; \
 				cuda) \
-					$(MAKE) --no-print-directory heat_cuda; \
-					line=$$(./heat_cuda --nx $$nx --ny $$nx --steps $(SCALING_STEPS) --snap-every $(SCALING_SNAP_EVERY) --outdir results/scaling_cuda_nx$$nx); \
-					echo "$$line,1" >> results/scaling.csv; \
+					$(MAKE) --no-print-directory heat_cuda || exit $$?; \
+					line=$$(./heat_cuda --nx $$nx --ny $$nx --steps $(SCALING_STEPS) --snap-every $(SCALING_SNAP_EVERY) --block-x $(SCALING_BLOCK_X) --block-y $(SCALING_BLOCK_Y) --outdir results/scaling_cuda_nx$${nx}_bx$(SCALING_BLOCK_X)_by$(SCALING_BLOCK_Y)); \
+					echo "$$line,1,$(SCALING_BLOCK_X),$(SCALING_BLOCK_Y)" >> results/scaling.csv; \
 					;; \
 				hybrid) \
-					$(MAKE) --no-print-directory heat_hybrid; \
+					$(MAKE) --no-print-directory heat_hybrid || exit $$?; \
 					for t in $(SCALING_THREADS_LIST); do \
-						line=$$(OMP_NUM_THREADS=$$t mpirun --mca btl ^openib -np $(SCALING_MPI_NP) ./heat_hybrid --nx $$nx --ny $$nx --steps $(SCALING_STEPS) --snap-every $(SCALING_SNAP_EVERY) --outdir results/scaling_hybrid_nx$${nx}_t$${t}); \
-						echo "$$line,$$t" >> results/scaling.csv; \
+						line=$$(OMP_NUM_THREADS=$$t mpirun --mca btl ^openib -np $(SCALING_MPI_NP) ./heat_hybrid --nx $$nx --ny $$nx --steps $(SCALING_STEPS) --snap-every $(SCALING_SNAP_EVERY) --block-x $(SCALING_BLOCK_X) --block-y $(SCALING_BLOCK_Y) --outdir results/scaling_hybrid_nx$${nx}_t$${t}_bx$(SCALING_BLOCK_X)_by$(SCALING_BLOCK_Y)); \
+						echo "$$line,$$t,$(SCALING_BLOCK_X),$(SCALING_BLOCK_Y)" >> results/scaling.csv; \
 					done; \
 					;; \
 				*) \

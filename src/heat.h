@@ -71,8 +71,8 @@ typedef enum { MAT_FR4 = 0, MAT_COPPER = 1, MAT_TIM = 2, MAT_SILICON = 3 } mater
     } while (0)
 #endif
 
-/* 2D row-major indexing helper: linear_index = j * nx + i. */
-#define IDX(g, i, j) ((j) * (g)->nx + (i))
+/* 2D row-major indexing helper with 64-bit-safe arithmetic. */
+#define IDX(g, i, j) ((size_t)(j) * (size_t)(g)->nx + (size_t)(i))
 
 /* Shared simulation state used by CPU, CUDA, and MPI paths. */
 typedef struct {

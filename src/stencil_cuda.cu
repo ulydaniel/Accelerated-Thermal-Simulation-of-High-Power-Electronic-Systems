@@ -53,12 +53,12 @@ __global__ void stencil_kernel_naive(const float *T_old, float *T_new,
                 expf(-(dx2 * dx2 + dy0 * dy0) / two_sigma2));
     }
 
-    int idx = j * nx + i;
+    size_t idx = (size_t)j * (size_t)nx + (size_t)i;
     float c = T_old[idx];
-    float n = T_old[(j + 1) * nx + i];
-    float s = T_old[(j - 1) * nx + i];
-    float e = T_old[j * nx + (i + 1)];
-    float w = T_old[j * nx + (i - 1)];
+    float n = T_old[(size_t)(j + 1) * (size_t)nx + (size_t)i];
+    float s = T_old[(size_t)(j - 1) * (size_t)nx + (size_t)i];
+    float e = T_old[(size_t)j * (size_t)nx + (size_t)(i + 1)];
+    float w = T_old[(size_t)j * (size_t)nx + (size_t)(i - 1)];
 
     T_new[idx] = c + dt * (ax * (e - 2.0f * c + w) / (dx * dx) +
                            ay * (n - 2.0f * c + s) / (dy * dy) +
@@ -89,7 +89,7 @@ __global__ void stencil_kernel_tiled(const float *T_old, float *T_new,
 
     /* Center load for each thread. */
     if (i >= 0 && i < nx && j >= 0 && j <= local_ny + 1) {
-        tile[center] = T_old[j * nx + i];
+        tile[center] = T_old[(size_t)j * (size_t)nx + (size_t)i];
     } else {
         tile[center] = T_AMBIENT;
     }
@@ -97,28 +97,31 @@ __global__ void stencil_kernel_tiled(const float *T_old, float *T_new,
     /* Halo loads: each edge thread pulls one extra neighbor cell. */
     if (tx == 0) {
         if (i - 1 >= 0 && j >= 0 && j <= local_ny + 1) {
-            tile[(ty + 1) * tile_pitch] = T_old[j * nx + (i - 1)];
+            tile[(ty + 1) * tile_pitch] =
+                T_old[(size_t)j * (size_t)nx + (size_t)(i - 1)];
         } else {
             tile[(ty + 1) * tile_pitch] = T_AMBIENT;
         }
     }
     if (tx == blockDim.x - 1) {
         if (i + 1 < nx && j >= 0 && j <= local_ny + 1) {
-            tile[(ty + 1) * tile_pitch + (blockDim.x + 1)] = T_old[j * nx + (i + 1)];
+            tile[(ty + 1) * tile_pitch + (blockDim.x + 1)] =
+                T_old[(size_t)j * (size_t)nx + (size_t)(i + 1)];
         } else {
             tile[(ty + 1) * tile_pitch + (blockDim.x + 1)] = T_AMBIENT;
         }
     }
     if (ty == 0) {
         if (j - 1 >= 0 && i >= 0 && i < nx) {
-            tile[tx + 1] = T_old[(j - 1) * nx + i];
+            tile[tx + 1] = T_old[(size_t)(j - 1) * (size_t)nx + (size_t)i];
         } else {
             tile[tx + 1] = T_AMBIENT;
         }
     }
     if (ty == blockDim.y - 1) {
         if (j + 1 <= local_ny + 1 && i >= 0 && i < nx) {
-            tile[(blockDim.y + 1) * tile_pitch + (tx + 1)] = T_old[(j + 1) * nx + i];
+            tile[(blockDim.y + 1) * tile_pitch + (tx + 1)] =
+                T_old[(size_t)(j + 1) * (size_t)nx + (size_t)i];
         } else {
             tile[(blockDim.y + 1) * tile_pitch + (tx + 1)] = T_AMBIENT;
         }
@@ -127,28 +130,31 @@ __global__ void stencil_kernel_tiled(const float *T_old, float *T_new,
     /* Corner halo loads (only four corner threads do this). */
     if (tx == 0 && ty == 0) {
         if (i - 1 >= 0 && j - 1 >= 0) {
-            tile[0][0] = T_old[(j - 1) * nx + (i - 1)];
+            tile[0] = T_old[(size_t)(j - 1) * (size_t)nx + (size_t)(i - 1)];
         } else {
-            tile[0][0] = T_AMBIENT;
+            tile[0] = T_AMBIENT;
         }
     }
     if (tx == blockDim.x - 1 && ty == 0) {
         if (i + 1 < nx && j - 1 >= 0) {
-            tile[blockDim.x + 1] = T_old[(j - 1) * nx + (i + 1)];
+            tile[blockDim.x + 1] =
+                T_old[(size_t)(j - 1) * (size_t)nx + (size_t)(i + 1)];
         } else {
             tile[blockDim.x + 1] = T_AMBIENT;
         }
     }
     if (tx == 0 && ty == blockDim.y - 1) {
         if (i - 1 >= 0 && j + 1 <= local_ny + 1) {
-            tile[(blockDim.y + 1) * tile_pitch] = T_old[(j + 1) * nx + (i - 1)];
+            tile[(blockDim.y + 1) * tile_pitch] =
+                T_old[(size_t)(j + 1) * (size_t)nx + (size_t)(i - 1)];
         } else {
             tile[(blockDim.y + 1) * tile_pitch] = T_AMBIENT;
         }
     }
     if (tx == blockDim.x - 1 && ty == blockDim.y - 1) {
         if (i + 1 < nx && j + 1 <= local_ny + 1) {
-            tile[(blockDim.y + 1) * tile_pitch + (blockDim.x + 1)] = T_old[(j + 1) * nx + (i + 1)];
+            tile[(blockDim.y + 1) * tile_pitch + (blockDim.x + 1)] =
+                T_old[(size_t)(j + 1) * (size_t)nx + (size_t)(i + 1)];
         } else {
             tile[(blockDim.y + 1) * tile_pitch + (blockDim.x + 1)] = T_AMBIENT;
         }
@@ -192,9 +198,10 @@ __global__ void stencil_kernel_tiled(const float *T_old, float *T_new,
     float e = tile[(ty + 1) * tile_pitch + (tx + 2)];
     float w = tile[(ty + 1) * tile_pitch + tx];
 
-    T_new[j * nx + i] = c + dt * (ax * (e - 2.0f * c + w) / (dx * dx) +
-                                  ay * (n - 2.0f * c + s) / (dy * dy) +
-                                  qdot / rhocp);
+    T_new[(size_t)j * (size_t)nx + (size_t)i] =
+        c + dt * (ax * (e - 2.0f * c + w) / (dx * dx) +
+                  ay * (n - 2.0f * c + s) / (dy * dy) +
+                  qdot / rhocp);
 }
 
 /* Allocate and upload all GPU-side buffers used during time stepping. */
