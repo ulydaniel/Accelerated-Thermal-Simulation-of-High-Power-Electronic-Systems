@@ -37,6 +37,32 @@ def parse_int(value: str) -> int:
         return -1
 
 
+def parse_block_size(row: list, header_idx: dict) -> int:
+    """
+    Parse one normalized block size.
+
+    Some CSV files append two extra columns where both represent the same
+    block size (e.g., block_x and block_y). We collapse those into one value.
+    """
+    candidates = []
+    for key in ("block_size", "block", "block_x", "block_y", "bx", "by"):
+        if key in header_idx and header_idx[key] < len(row):
+            candidates.append(parse_int(row[header_idx[key]].strip()))
+
+    # Backward-compatibility path for files that have unnamed trailing columns.
+    if len(row) > 7:
+        candidates.append(parse_int(row[7].strip()))
+    if len(row) > 8:
+        candidates.append(parse_int(row[8].strip()))
+
+    positive_vals = [v for v in candidates if v > 0]
+    if not positive_vals:
+        return 0
+
+    # Columns 8 and 9 are expected to match; if they differ, keep first valid.
+    return positive_vals[0]
+
+
 def series_label(variant: str, threads: int) -> str:
     """Build plotting label; include thread count for OMP-based variants."""
     if variant in ("omp", "hybrid") and threads > 0:
@@ -70,6 +96,7 @@ def load_scaling_runs(csv_path: str) -> list:
         nsteps = ""
         threads = ""
         t = None
+        block_size = 0
 
         # Preferred parse path: named columns.
         if "variant" in header_idx and header_idx["variant"] < len(row):
@@ -88,6 +115,7 @@ def load_scaling_runs(csv_path: str) -> list:
             threads = row[header_idx["omp_threads"]].strip()
         elif "threads" in header_idx and header_idx["threads"] < len(row):
             threads = row[header_idx["threads"]].strip()
+        block_size = parse_block_size(row, header_idx)
 
         if "time_s" in header_idx and header_idx["time_s"] < len(row):
             val = row[header_idx["time_s"]].strip()
@@ -131,6 +159,7 @@ def load_scaling_runs(csv_path: str) -> list:
                     "nranks": parse_int(nranks),
                     "nsteps": parse_int(nsteps),
                     "threads": parse_int(threads),
+                    "block_size": block_size,
                     "wall_time_s": t,
                 }
             )
@@ -139,27 +168,142 @@ def load_scaling_runs(csv_path: str) -> list:
 
 
 def summarize_scaling_runs(parsed_runs: list, csv_path: str) -> None:
-    """Print one normalized line per scaling run."""
+    """
+    Print sorted aggregated table from scaling runs.
+
+    The output is CSV-style to remain easy to parse in downstream scripts.
+    """
     if not parsed_runs:
         print(f"No usable rows found in {csv_path}")
         return
 
-    print("variant,trial,nx,ny,nranks,nsteps,omp_threads,wall_time_s")
-    trial_by_series = defaultdict(int)
+    header, rows = build_scaling_table_rows(parsed_runs)
+    print(",".join(header))
+    for row in rows:
+        print(",".join(row))
+
+
+def build_scaling_table_rows(parsed_runs: list) -> tuple:
+    """
+    Build sorted aggregated scaling table rows for text/UI display.
+
+    Returns (header, rows), where each row is a list of strings.
+    """
+    grouped = defaultdict(list)
     for run in parsed_runs:
-        variant = run["variant"]
-        threads = run["threads"]
-        if threads <= 0:
-            threads = 1
-        label = series_label(variant, threads)
-        nx = "" if run["nx"] < 0 else str(run["nx"])
-        ny = "" if run["ny"] < 0 else str(run["ny"])
-        nranks = "" if run["nranks"] < 0 else str(run["nranks"])
-        nsteps = "" if run["nsteps"] < 0 else str(run["nsteps"])
-        wall_time = run["wall_time_s"]
-        trial_by_series[label] += 1
-        trial = trial_by_series[label]
-        print(f"{variant},{trial},{nx},{ny},{nranks},{nsteps},{threads},{wall_time:.6f}")
+        key = (
+            run["variant"],
+            run["nx"],
+            run["ny"],
+            run["nranks"],
+            run["nsteps"],
+            max(1, run["threads"]),
+            run.get("block_size", 0),
+        )
+        grouped[key].append(run["wall_time_s"])
+
+    variant_rank = {"serial": 0, "omp": 1, "cuda": 2, "hybrid": 3}
+
+    def sort_key(item: tuple) -> tuple:
+        (variant, nx, ny, nranks, nsteps, threads, block_size), _times = item
+        return (
+            nx if nx > 0 else 10**9,
+            ny if ny > 0 else 10**9,
+            variant_rank.get(variant, 99),
+            variant,
+            nranks if nranks > 0 else 10**9,
+            threads if threads > 0 else 10**9,
+            block_size if block_size > 0 else 10**9,
+            nsteps if nsteps > 0 else 10**9,
+        )
+
+    serial_baseline = {}
+    for key, times in grouped.items():
+        variant, nx, ny, _nranks, nsteps, _threads, _block_size = key
+        if variant != "serial":
+            continue
+        problem_key = (nx, ny, nsteps)
+        mean_time = float(np.mean(times))
+        if problem_key not in serial_baseline:
+            serial_baseline[problem_key] = mean_time
+        else:
+            serial_baseline[problem_key] = min(serial_baseline[problem_key], mean_time)
+
+    header = [
+        "variant",
+        "nx",
+        "ny",
+        "nranks",
+        "nsteps",
+        "omp_threads",
+        "block_size",
+        "samples",
+        "wall_time_s",
+        "speedup_vs_serial",
+    ]
+    rows = []
+    for key, times in sorted(grouped.items(), key=sort_key):
+        variant, nx, ny, nranks, nsteps, threads, block_size = key
+        mean_t = float(np.mean(times))
+
+        base = serial_baseline.get((nx, ny, nsteps))
+        speedup = ""
+        if base is not None and mean_t > 0.0:
+            speedup = f"{(base / mean_t):.6f}"
+
+        rows.append(
+            [
+                variant,
+                str(nx),
+                str(ny),
+                str(nranks),
+                str(nsteps),
+                str(threads),
+                str(block_size),
+                str(len(times)),
+                f"{mean_t:.6f}",
+                speedup,
+            ]
+        )
+
+    return header, rows
+
+
+def show_scaling_ui_table(parsed_runs: list, title: str) -> None:
+    """
+    Show a visual UI table of sorted scaling metrics using matplotlib.
+    """
+    if not parsed_runs:
+        print("No scaling rows available for UI table.")
+        return
+
+    header, rows = build_scaling_table_rows(parsed_runs)
+    if not rows:
+        print("No scaling rows available for UI table.")
+        return
+
+    nrows = len(rows)
+    fig_height = max(5.5, min(0.42 * nrows + 2.4, 24.0))
+    fig = plt.figure(figsize=(20, fig_height))
+    ax = fig.add_subplot(111)
+    ax.axis("off")
+
+    table = ax.table(
+        cellText=rows,
+        colLabels=header,
+        loc="center",
+        cellLoc="center",
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(10)
+    table.scale(1.05, 1.55)
+    for (row_idx, _col_idx), cell in table.get_celld().items():
+        if row_idx == 0:
+            cell.set_text_props(weight="bold")
+
+    fig.suptitle(title, fontsize=14, y=0.985)
+    plt.tight_layout()
+    plt.show()
 
 
 def plot_scaling_comparison(parsed_runs: list, save_prefix: str) -> None:
@@ -186,6 +330,60 @@ def plot_scaling_comparison(parsed_runs: list, save_prefix: str) -> None:
     variants = sorted(points.keys())
     serial_key = "serial" if "serial" in points else None
 
+    thread_colors = {
+        1: "tab:gray",
+        2: "tab:brown",
+        4: "tab:blue",
+        8: "tab:orange",
+        12: "tab:olive",
+        16: "tab:green",
+        24: "tab:cyan",
+        32: "tab:purple",
+        64: "tab:pink",
+    }
+
+    def style_for_series(label: str) -> dict:
+        base_variant = label.split("-", 1)[0]
+        if base_variant == "serial":
+            return {
+                "color": "black",
+                "linestyle": "--",
+                "marker": "s",
+                "linewidth": 2.6,
+            }
+        if base_variant == "cuda":
+            return {
+                "color": "tab:red",
+                "linestyle": "-",
+                "marker": "o",
+                "linewidth": 2.6,
+            }
+
+        match = re.search(r"-t(\d+)$", label)
+        threads = int(match.group(1)) if match else 0
+        color = thread_colors.get(threads, "tab:blue")
+
+        if base_variant == "omp":
+            return {
+                "color": color,
+                "linestyle": "-",
+                "marker": "o",
+                "linewidth": 2.0,
+            }
+        if base_variant == "hybrid":
+            return {
+                "color": color,
+                "linestyle": "--",
+                "marker": "D",
+                "linewidth": 2.0,
+            }
+        return {
+            "color": color,
+            "linestyle": "-.",
+            "marker": "o",
+            "linewidth": 2.0,
+        }
+
     stats = {}
     for variant in variants:
         nx_vals = sorted(points[variant].keys())
@@ -203,8 +401,23 @@ def plot_scaling_comparison(parsed_runs: list, save_prefix: str) -> None:
 
     for variant in variants:
         st = stats[variant]
-        ax_runtime.plot(st["nx"], st["mean"], marker="o", linewidth=2, label=variant)
-        ax_runtime.fill_between(st["nx"], st["min"], st["max"], alpha=0.18)
+        style = style_for_series(variant)
+        ax_runtime.plot(
+            st["nx"],
+            st["mean"],
+            marker=style["marker"],
+            linewidth=style["linewidth"],
+            linestyle=style["linestyle"],
+            color=style["color"],
+            label=variant,
+        )
+        ax_runtime.fill_between(
+            st["nx"],
+            st["min"],
+            st["max"],
+            color=style["color"],
+            alpha=0.12,
+        )
 
     ax_runtime.set_xscale("log", base=2)
     ax_runtime.set_yscale("log")
@@ -223,6 +436,7 @@ def plot_scaling_comparison(parsed_runs: list, save_prefix: str) -> None:
             common_nx = [int(nx) for nx in st["nx"] if int(nx) in serial_means]
             if not common_nx:
                 continue
+            style = style_for_series(variant)
             speedups = []
             for nx in common_nx:
                 variant_mean = float(np.mean(points[variant][nx]))
@@ -230,8 +444,10 @@ def plot_scaling_comparison(parsed_runs: list, save_prefix: str) -> None:
             ax_speedup.plot(
                 np.array(common_nx, dtype=float),
                 np.array(speedups, dtype=float),
-                marker="o",
-                linewidth=2,
+                marker=style["marker"],
+                linewidth=style["linewidth"],
+                linestyle=style["linestyle"],
+                color=style["color"],
                 label=variant,
             )
         ax_speedup.axhline(1.0, color="k", linestyle="--", linewidth=1)
@@ -649,6 +865,11 @@ def main() -> None:
         help="If set, save scaling figure to <prefix>.png and <prefix>.pdf.",
     )
     parser.add_argument(
+        "--show-scaling-table",
+        action="store_true",
+        help="Open a matplotlib UI table of sorted scaling metrics.",
+    )
+    parser.add_argument(
         "--step",
         type=int,
         default=-1,
@@ -694,6 +915,8 @@ def main() -> None:
         csv_path = resolve_scaling_csv(args.csv, args.ask_csv)
         runs = load_scaling_runs(csv_path)
         summarize_scaling_runs(runs, csv_path)
+        if args.show_scaling_table:
+            show_scaling_ui_table(runs, "Scaling metrics table")
         if not args.no_scaling_plot:
             plot_scaling_comparison(runs, args.scaling_save_prefix)
     elif args.mode == "heatmap":
