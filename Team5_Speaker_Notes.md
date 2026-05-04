@@ -25,11 +25,11 @@ You will get questions on this. The **original project proposal in our notes was
 
 ## Slide 2 — Physical Problem
 
-> "The physical motivation is real and current. Modern processors dissipate hundreds of watts in dies that are only a few millimeters across. Wherever transistor density spikes — the integer cores, the FPU, the L2 controllers — you get localized hot spots, and if those aren't managed, the chip throttles, electromigration accelerates, and eventually the device fails. So thermal engineers need to simulate where heat actually goes inside the package."
->
-> "What we simulate is a 2D vertical cross-section of a real IC stack-up. Heat starts at the silicon die at the top, then has to travel through a thin layer of thermal interface material — the TIM — into a copper heat-spreader, and finally down into the FR4 substrate underneath. Each of those four layers has *anisotropic* thermal conductivity, meaning heat doesn't flow at the same rate in the in-plane and through-plane directions — that's important for FR4 because the glass-fiber weave conducts heat differently along the board than across it. So our stencil update has to look up material properties cell-by-cell, which makes this more interesting computationally than a homogeneous block."
+> "The physical motivation is real and current. Modern processors dissipate hundreds of watts in dies that are only a few millimeters across. Wherever transistor density spikes — the cores, the FPU, the L2 controllers — you get localized hot spots, and if those aren't managed, the chip throttles, electromigration accelerates, and eventually the device fails. So we try to simulate where heat actually goes inside the package."
 
-*(If asked why 2D not 3D — see the note at the top of these notes.)*
+> "Within a 2D vertical cross-section of a real IC stack-up. Heat starts at the silicon die at the top, then has to travel through a thin layer of thermal interface material — the TIM — into a copper heat-spreader, and finally down into the FR4 substrate underneath. Each of those four layers has *anisotropic* thermal conductivity, meaning heat doesn't flow at the same rate in the in-plane and through-plane directions — that's important for FR4 because the glass-fiber weave conducts heat differently along the board than across it. So our stencil update has to look up material properties cell-by-cell, which makes this more computationally intensive."
+
+*(If asked why 2D instead of 3D: we chose 2D because it fits comfortably in GPU memory at our largest grid sizes so we could run a full scaling study up to 65,536², while still capturing the key layered hot-spot physics in a vertical cross-section.)*
 
 ---
 
@@ -43,19 +43,21 @@ You will get questions on this. The **original project proposal in our notes was
 
 ## Slide 4 — Mathematical Models
 
-> "This is the governing equation. On the left, ρcₚ times the partial of temperature with respect to time — that's how much energy a cell has to absorb to change temperature. On the right, the first two terms are the spatial diffusion: the second derivative of T in x weighted by k_x, and the second derivative in y weighted by k_y. The fact that those two conductivities are *separate* is the anisotropy — for FR4, k_x is 0.8 W/m·K but k_y is only 0.3, almost a factor of three difference. Q(x,y) is the volumetric heat source — that's where our hot spots inject energy into the silicon."
+> "This is the heat equation we solve. Left side first: `ρ c_p * dT/dt`. Here `ρ` is density, `c_p` is specific heat, and `ρ c_p` together is volumetric heat capacity — basically thermal inertia. So that term says how hard it is to change temperature in each material."
 >
-> "We discretize with explicit finite differences on a structured Cartesian grid: each cell's new temperature depends on its current value plus the four immediate neighbors — north, south, east, west — that's the standard 5-point 2D stencil. Time integration is forward Euler with a CFL-stable Δt computed from the worst-case diffusivity across all four materials, which in our case is dominated by copper. The table on the right shows the four materials. Notice copper at 400 in both directions versus FR4 at 0.8 and 0.3 — that three-orders-of-magnitude span across the domain is exactly why this problem doesn't have a closed-form solution and we have to solve it numerically."
+> "Right side is heat spreading and heat generation. `k_x * d²T/dx²` is conduction in x, `k_y * d²T/dy²` is conduction in y, and `Q(x,y)` is the heat source from our hotspot power. Having separate `k_x` and `k_y` is anisotropy. For FR4, `k_x = 0.8` and `k_y = 0.3`, so heat spreads much better in one direction than the other."
+>
+> "In plain terms, each grid cell updates from itself and its four neighbors: up, down, left, and right. We advance in small time steps so the simulation stays stable, with the step size chosen based on the fastest-spreading material, which is copper. Since copper moves heat far faster than FR4, there is no simple one-line solution, so we solve it numerically."
 
 ---
 
 ## Slide 5 — Code Implementation
 
-> "A few implementation choices that matter for performance. First, even though the grid is logically 2D, we store it as a *flattened 1D array* — that's the `IDX(g, i, j)` macro you'll see throughout the code. That gives the compiler — and the GPU — clean, contiguous memory access patterns that are friendly to cache lines and to coalesced loads."
+> "A few implementation choices that matter for performance. First, even though the grid is logically 2D, we store it as a *flattened 1D array* — that's the `IDX(g, i, j)` macro you'll see throughout the code. That gives the compiler — and the GPU — clean, contiguous memory access patterns that are friendly to index."
 >
-> "Second, we use double-buffering: `T_old` for reads and `T_new` for writes, swapped every step. This is essential — if you read and write the same buffer, your stencil sees a mixture of old and new values and the result is wrong. With two buffers, the math is safe to parallelize across all cells simultaneously, which is what makes both OpenMP and CUDA possible."
+> "Second, we use double-buffering: `T_old` for reads and `T_new` for writes, swapped every step. This is essential, With two buffers, the math is safe to parallelize across all cells simultaneously, which is what makes both OpenMP and CUDA possible."
 >
-> "Third, we precompute a per-row material ID once during grid initialization and reuse it every step. We don't recompute layer assignments inside the hot loop. The hotspot source on the right uses three Gaussian profiles centered at the three core positions, evaluated only when the current cell is silicon — that branch is uniform across each row so it's cheap on the GPU. And finally, all timing output is CSV so we can pipe it straight into our plotting scripts."
+> "Third, we determine each row's material once at startup and then reuse that lookup on every time step. That keeps the inner loop simple and fast because we avoid re-deciding material thousands of times. We model power as three Gaussian hotspots at the core locations, and we apply that source only in silicon cells where active devices live. Since many threads in the same row follow the same material rule, the GPU executes this branch efficiently. Finally, we write timing outputs in CSV format so plotting scripts can consume results automatically."
 
 ---
 
